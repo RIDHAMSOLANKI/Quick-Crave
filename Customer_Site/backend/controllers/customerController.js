@@ -834,7 +834,7 @@ exports.fetchMenu = async (req, res) => {
         }
         // Uses the dishes(canteen_id) WHERE is_active index.
         const rows = await cache.getOrLoad(cache.keys.menu(canteenId), CATALOG_TTL_SECONDS, async () => (await db.query(
-            `SELECT dish_name, img_url, rating, price, is_veg, dish_id, dish_tag
+            `SELECT dish_name, img_url, rating, price, is_veg, dish_id, dish_tag, stock
                FROM dishes WHERE canteen_id = $1 AND is_active = true`,
             [canteenId]
         )).rows);

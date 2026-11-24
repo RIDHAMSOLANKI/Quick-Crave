@@ -70,6 +70,7 @@ async function startStack() {
     hardening = hardening.replace(/CREATE INDEX IF NOT EXISTS dishes_name_trgm_idx[^\n]*\n/, '');
     await admin.query(hardening);
   }
+  await admin.query(fs.readFileSync(path.join(ROOT, 'database/003_stock.sql'), 'utf8'));
 
   const customerApp = require(path.join(ROOT, 'Customer_Site/backend/app'));
   const canteenApp = require(path.join(ROOT, 'Canteen_Site/backend/app'));
@@ -137,11 +138,11 @@ async function createCanteen(admin, { username, autoAccept = false }) {
   return rows[0].canteen_id;
 }
 
-async function createDish(admin, canteenId, price) {
+async function createDish(admin, canteenId, price, { stock = null, name } = {}) {
   const { rows } = await admin.query(
-    `INSERT INTO dishes (canteen_id, price, dish_name, is_veg, is_active, is_available)
-     VALUES ($1, $2, $3, true, true, true) RETURNING dish_id`,
-    [canteenId, price, "Dish " + price]
+    `INSERT INTO dishes (canteen_id, price, dish_name, is_veg, is_active, is_available, stock)
+     VALUES ($1, $2, $3, true, true, true, $4) RETURNING dish_id`,
+    [canteenId, price, name || "Dish " + price, stock]
   );
   return rows[0].dish_id;
 }

@@ -12,6 +12,13 @@ const STATUS = require('../lib/orderStatus');
 const { enqueue } = require('../lib/queue');
 const { HttpError, sendError } = require('../lib/httpError');
 
+// stock: null/undefined/'' = unlimited, otherwise an integer >= 0.
+const parseStock = (v) => {
+  if (v === null || v === undefined || v === '') return { ok: true, value: null };
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 0 ? { ok: true, value: n } : { ok: false };
+};
+
 const toId = (v) => {
   const n = Number(v);
   return Number.isInteger(n) && n > 0 ? n : null;
@@ -526,6 +533,11 @@ exports.editDish = async (req, res) => {
       [d.price, d.is_veg, d.dish_name, d.dish_tag, d.img_url, d.dish_category, d.dish_id, req.canteen_id]
     );
     if (rowCount === 0) throw new HttpError(404, 'Dish not found');
+    if ('stock' in d) {
+      const st = parseStock(d.stock);
+      if (!st.ok) throw new HttpError(400, 'stock must be empty (unlimited) or a whole number >= 0');
+      await db.query('UPDATE dishes SET stock = $1 WHERE dish_id = $2 AND canteen_id = $3', [st.value, d.dish_id, req.canteen_id]);
+    }
     await invalidateMenu(req.canteen_id); // DB first, then delete the cache key
     return res.status(200).json({ message: 'Dish Details Edited Successfully' });
   } catch (err) {
@@ -536,16 +548,38 @@ exports.editDish = async (req, res) => {
 exports.addDish = async (req, res) => {
   const d = req.body;
   try {
+    const st = parseStock(d.stock);
+    if (!st.ok) throw new HttpError(400, 'stock must be empty (unlimited) or a whole number >= 0');
     await db.withTransaction(async (client) => {
       const r = await client.query(
-        `INSERT INTO dishes (canteen_id, price, discount, rating, order_count, is_veg, dish_name, dish_tag, img_url, dish_category)
-         VALUES ($1, $2, $3, 0, 0, $4, $5, $6, $7, $8) RETURNING dish_id`,
-        [req.canteen_id, d.price, d.discount || 0, d.is_veg, d.name, d.dish_tag, d.img_url, d.dish_category]
+        `INSERT INTO dishes (canteen_id, price, discount, rating, order_count, is_veg, dish_name, dish_tag, img_url, dish_category, stock)
+         VALUES ($1, $2, $3, 0, 0, $4, $5, $6, $7, $8, $9) RETURNING dish_id`,
+        [req.canteen_id, d.price, d.discount || 0, d.is_veg, d.name, d.dish_tag, d.img_url, d.dish_category, st.value]
       );
       await client.query('UPDATE canteens SET menu = array_append(menu, $2) WHERE canteen_id = $1', [req.canteen_id, r.rows[0].dish_id]);
     });
     await invalidateMenu(req.canteen_id);
     return res.status(200).json({ message: 'Dish Added Successfully' });
+  } catch (err) {
+    return sendError(res, err);
+  }
+};
+
+// POST /canteen/update-stock  { dish_id, stock }  (stock: null = unlimited)
+// Sets the absolute count, e.g. "we made 40 samosas". Payments decrement it
+// atomically; this just overwrites it for the canteen's own dish.
+exports.updateStock = async (req, res) => {
+  try {
+    const dishId = toId(req.body.dish_id);
+    const st = parseStock(req.body.stock);
+    if (!dishId || !st.ok) throw new HttpError(400, 'dish_id and stock (empty or a whole number >= 0) are required');
+    const r = await db.query(
+      'UPDATE dishes SET stock = $1 WHERE dish_id = $2 AND canteen_id = $3 RETURNING dish_id, stock',
+      [st.value, dishId, req.canteen_id]
+    );
+    if (r.rowCount === 0) throw new HttpError(404, 'Dish not found');
+    await invalidateMenu(req.canteen_id);
+    return res.status(200).json({ success: true, message: 'Stock updated', ...r.rows[0] });
   } catch (err) {
     return sendError(res, err);
   }

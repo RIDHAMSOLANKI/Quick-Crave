@@ -12,11 +12,12 @@
 //   * DB constraints as the last line of defence (CHECK wallet >= 0, one open
 //     cart per customer) - see database/002_hardening.sql.
 //
-// Lock order is always customers -> orders -> canteens, so two flows can never
-// wait on each other in a circle (deadlock).
+// Lock order is always customers -> orders -> dishes (by dish_id) -> canteens,
+// so two flows can never wait on each other in a circle (deadlock).
 
 const db = require('../db');
 const STATUS = require('../lib/orderStatus');
+const cache = require('../lib/cache');
 const { enqueue } = require('../lib/queue');
 const { HttpError, sendError } = require('../lib/httpError');
 
@@ -38,6 +39,73 @@ async function lockCustomer(client, customerId) {
   return rows[0];
 }
 
+/**
+ * Take stock for every dish in the order. Must run inside the payment
+ * transaction. Returns true if any stock-tracked dish changed.
+ *
+ * Race it prevents (overselling): 1 Samosa left, two students pay at once.
+ * Each UPDATE carries its own check ("stock >= qty"). Postgres locks the row
+ * while updating, so the second student's UPDATE waits, re-checks against the
+ * NEW stock (0), changes 0 rows, and we throw -> the whole payment rolls back.
+ *
+ * Deadlock it prevents: order A = {Samosa, Chai}, order B = {Chai, Samosa}.
+ * If A locked Samosa then Chai while B locked Chai then Samosa, they could
+ * wait on each other forever. Sorting by dish_id makes every payment take the
+ * dish locks in the same order.
+ *
+ * The same statement bumps order_count (for "top dishes") and re-checks that
+ * the dish is still on sale (the canteen may have switched it off).
+ */
+async function takeStock(client, dishMap) {
+  const items = Object.entries(dishMap || {})
+    .map(([id, qty]) => [Number(id), Number(qty)])
+    .filter(([id, qty]) => Number.isInteger(id) && qty > 0)
+    .sort((a, b) => a[0] - b[0]);
+
+  let stockChanged = false;
+  for (const [dishId, qty] of items) {
+    const r = await client.query(
+      `UPDATE dishes
+          SET stock = CASE WHEN stock IS NULL THEN NULL ELSE stock - $2 END,
+              order_count = COALESCE(order_count, 0) + $2
+        WHERE dish_id = $1 AND is_active AND is_available
+          AND (stock IS NULL OR stock >= $2)
+        RETURNING stock`,
+      [dishId, qty]
+    );
+    if (r.rowCount === 0) {
+      const d = await client.query('SELECT dish_name, stock, is_active, is_available FROM dishes WHERE dish_id = $1', [dishId]);
+      const info = d.rows[0];
+      const name = (info && info.dish_name) || `Dish ${dishId}`;
+      const left = info && info.is_active && info.is_available ? info.stock : 0;
+      throw new HttpError(409, left > 0 ? `Only ${left} ${name} left` : `${name} is sold out`, {
+        dish_id: dishId,
+        stock_left: left || 0,
+      });
+    }
+    if (r.rows[0].stock !== null) stockChanged = true;
+  }
+  return stockChanged;
+}
+
+// Friendly early check used by add-to-cart and request-order. NOT the real
+// guard (stock can still change after this); takeStock() at payment is.
+async function findShortDish(q, dishMap) {
+  const { rows } = await q.query(
+    `SELECT d.dish_id, d.dish_name, d.stock, d.is_active, d.is_available, (m.qty)::int AS qty
+       FROM jsonb_each_text($1::jsonb) AS m(dish_id, qty)
+       JOIN dishes d ON d.dish_id = m.dish_id::int
+      WHERE NOT (d.is_active AND d.is_available) OR (d.stock IS NOT NULL AND d.stock < (m.qty)::int)
+      ORDER BY d.dish_id
+      LIMIT 1`,
+    [JSON.stringify(dishMap || {})]
+  );
+  return rows[0] || null;
+}
+
+const shortMessage = (d) =>
+  d.is_active && d.is_available && d.stock > 0 ? `Only ${d.stock} ${d.dish_name} left` : `${d.dish_name} is sold out`;
+
 // ---------------------------------------------------------------------------
 // Cart
 // ---------------------------------------------------------------------------
@@ -51,11 +119,29 @@ exports.addDishToCart = async (req, res) => {
       const customer = await lockCustomer(client, req.customer_id);
 
       const dish = await client.query(
-        'SELECT canteen_id, price FROM dishes WHERE dish_id = $1 AND is_active AND is_available',
+        'SELECT canteen_id, price, stock, dish_name FROM dishes WHERE dish_id = $1 AND is_active AND is_available',
         [dishId]
       );
       if (dish.rows.length === 0) throw new HttpError(404, 'Dish not found');
-      const { canteen_id: canteenId, price } = dish.rows[0];
+      const { canteen_id: canteenId, price, stock, dish_name: dishName } = dish.rows[0];
+
+      // Early, friendly stock check (the real guard is takeStock() at payment).
+      // The customer row is locked, so this customer's cart can't change meanwhile.
+      if (stock !== null) {
+        let inCart = 0;
+        if (customer.cart_id) {
+          const c = await client.query('SELECT COALESCE((dish_map->>$2::text)::int, 0) AS qty FROM orders WHERE order_id = $1', [
+            customer.cart_id,
+            String(dishId),
+          ]);
+          inCart = c.rows[0] ? c.rows[0].qty : 0;
+        }
+        if (inCart + 1 > stock) {
+          throw new HttpError(409, stock > 0 ? `Only ${stock} ${dishName} left` : `${dishName} is sold out`, {
+            stock_left: stock,
+          });
+        }
+      }
 
       if (!customer.cart_id) {
         // First item: create the cart. The customer row is locked, so a second
@@ -175,7 +261,7 @@ exports.requestOrder = async (req, res) => {
       if (!customer.cart_id) throw new HttpError(404, 'No active cart found for this customer');
 
       const order = await client.query(
-        `SELECT o.order_id, o.status, o.final_amount, c.auto_accept, c.opening_status
+        `SELECT o.order_id, o.status, o.final_amount, o.dish_map, c.auto_accept, c.opening_status
            FROM orders o JOIN canteens c ON c.canteen_id = o.canteen_id
           WHERE o.order_id = $1 FOR UPDATE OF o`,
         [customer.cart_id]
@@ -188,6 +274,9 @@ exports.requestOrder = async (req, res) => {
         return { orderId: o.order_id, status: o.status, duplicate: true };
       }
       if (o.opening_status === false) throw new HttpError(409, 'This canteen is closed right now');
+      // Don't bother the canteen with an order it can't fill (early check only).
+      const short = await findShortDish(client, o.dish_map);
+      if (short) throw new HttpError(409, shortMessage(short), { dish_id: short.dish_id, stock_left: short.stock || 0 });
       if (Number(o.final_amount) > Number(customer.wallet_balance)) {
         throw new HttpError(402, 'Insufficient wallet balance');
       }
@@ -258,7 +347,11 @@ exports.placeOrder = async (req, res) => {
 
       const amount = Math.round(Number(o.final_amount));
 
-      // 3. Check-and-debit in ONE statement. The CHECK (wallet_balance >= 0)
+      // 3. Take the stock (see takeStock). If any dish is sold out this throws,
+      //    and the whole transaction rolls back: no money, no stock taken.
+      const stockChanged = await takeStock(client, o.dish_map);
+
+      // 4. Check-and-debit in ONE statement. The CHECK (wallet_balance >= 0)
       //    constraint is a second guard if anything ever bypasses this.
       const debit = await client.query(
         `UPDATE customers SET wallet_balance = wallet_balance - $1, cart_id = 0
@@ -268,7 +361,7 @@ exports.placeOrder = async (req, res) => {
       );
       if (debit.rowCount === 0) throw new HttpError(402, 'Insufficient wallet balance');
 
-      // 4. The rest of the money movement, all in the same transaction.
+      // 5. The rest of the money movement, all in the same transaction.
       await client.query('UPDATE orders SET status = $1 WHERE order_id = $2 AND status = $3', [
         STATUS.PAID,
         o.order_id,
@@ -282,16 +375,22 @@ exports.placeOrder = async (req, res) => {
         'INSERT INTO transactions (order_id, customer_id, time, amount) VALUES ($1, $2, NOW(), $3)',
         [o.order_id, req.customer_id, -amount]
       );
-      // Popularity counter for "top dishes" (atomic increments).
-      for (const [dishId, qty] of Object.entries(o.dish_map || {})) {
-        await client.query('UPDATE dishes SET order_count = COALESCE(order_count, 0) + $1 WHERE dish_id = $2', [
-          Number(qty),
-          Number(dishId),
-        ]);
-      }
 
-      return { orderId: o.order_id, amount, balance: debit.rows[0].wallet_balance, email: customer.email };
+      return {
+        orderId: o.order_id,
+        amount,
+        balance: debit.rows[0].wallet_balance,
+        email: customer.email,
+        canteenId: o.canteen_id,
+        stockChanged,
+      };
     });
+
+    // Stock changed -> the cached menu shows old "portions left". Drop it
+    // (after commit, like every other cache invalidation).
+    if (paid.stockChanged) {
+      await cache.invalidate(cache.keys.menu(paid.canteenId), cache.keys.dishes());
+    }
 
     await enqueue('send-email', {
       to: paid.email,

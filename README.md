@@ -60,13 +60,27 @@ exactly one wins and the other gets `409 Conflict`.
 | Two table bookings with low balance | Wallet overdrawn, unpaid booking left behind | Debit first with a conditional update, then insert, in one transaction |
 | Reservation rejected twice | Refunded twice | Guarded update + refund in the same transaction |
 | Two sign-ups with the same username | Duplicate accounts | `UNIQUE` indexes; error `23505` → "already taken" |
-| Deadlocks | Two flows wait on each other forever | Fixed lock order (customer → order → canteen) + automatic retry on `40P01` / `40001` |
+| More buyers than portions (5 samosas, 20 buyers) | Overselling: stock goes negative, people pay for food that doesn't exist | Stock taken **inside the payment transaction** with `UPDATE dishes SET stock = stock - qty WHERE stock >= qty`; if any dish changes 0 rows the whole payment rolls back (no money, no stock taken) + `CHECK (stock >= 0)` |
+| Two orders sharing dishes pay at once | Deadlock (A locks Samosa→Chai, B locks Chai→Samosa) | Dish rows always updated in `dish_id` order |
+| Deadlocks in general | Two flows wait on each other forever | Fixed lock order (customer → order → dishes by id → canteen) + automatic retry on `40P01` / `40001` |
 
 All of these are covered by tests that fire many identical requests **at the
 same instant** against a real PostgreSQL and then check the invariants
 (see `tests/concurrency.test.js`).
 
 ---
+
+## Inventory (stock)
+
+- `dishes.stock`: `NULL` = unlimited (tea), a number = portions left. `CHECK (stock >= 0)`.
+- **Taken at payment**, not at add-to-cart, so abandoned carts never hold stock.
+- Add-to-cart and request-order give an early "Only 3 Samosa left" warning, but
+  only the payment transaction decides.
+- Canteens set the count with `POST /canteen/update-stock { dish_id, stock }`
+  (or `stock` on add-dish / edit-dish). A canteen can only change its own dishes.
+- After a payment changes stock, the cached menu for that canteen is deleted.
+- At flash-sale scale, a Redis atomic counter (`DECRBY`) in front of the database
+  would turn most extra buyers away before they reach Postgres.
 
 ## Caching (Redis, cache-aside)
 
@@ -110,6 +124,7 @@ See `database/002_hardening.sql`: `orders(canteen_id, time)`, `orders(customer_i
 createdb quickcrave
 psql -d quickcrave -f database/001_schema.sql
 psql -d quickcrave -f database/002_hardening.sql
+psql -d quickcrave -f database/003_stock.sql
 ```
 
 ### 2. Backends
